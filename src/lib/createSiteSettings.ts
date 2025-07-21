@@ -3,7 +3,7 @@ import { db } from "./firebase";
 
 export async function createSiteSettings(
   siteId: string,
-   data: {
+  data: {
     ownerId: string;
     siteName: string;
     siteKey: string;
@@ -11,7 +11,10 @@ export async function createSiteSettings(
     ownerAddress: string;
     ownerPhone: string;
     ownerEmail: string;
-    homepageUrl?: string; // ← オプショナルに変更
+    homepageUrl?: string;
+    stripeCustomerId?: string;
+    stripeSubscriptionId?: string;
+    isFreePlan: boolean;
   }
 ) {
   const ref = doc(db, "siteSettings", siteId);

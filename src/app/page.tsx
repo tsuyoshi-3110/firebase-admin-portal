@@ -31,10 +31,10 @@ export default function Home() {
   return (
     <div className="flex flex-col items-center justify-center min-h-[calc(100vh-120px)] gap-6 p-8">
       <Image
-        src="/images/pageitLogo.png"
+        src="/images/logo.png"
         alt="Pageit Logo"
-        width={300}
-        height={300}
+        width={450}
+        height={450}
         className="mb-4"
       />
 

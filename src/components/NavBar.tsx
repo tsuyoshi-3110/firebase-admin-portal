@@ -4,7 +4,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { auth } from "@/app/lib/firebase";
+import { auth } from "@/lib/firebase";
 import { User } from "firebase/auth";
 import { useAtomValue } from "jotai";
 import { openFlagAtom } from "@/lib/atoms/openFlagAtom";

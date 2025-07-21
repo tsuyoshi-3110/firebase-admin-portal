@@ -1,10 +1,9 @@
-// 修正された RegisterPage コンポーネント
+// 修正された RegisterPage：Stripe 連携用
 "use client";
 
 import { useEffect, useState } from "react";
-import { createUserWithEmailAndPassword } from "firebase/auth";
-import { auth, db } from "../lib/firebase";
-import { createSiteSettings } from "../lib/createSiteSettings";
+import { auth, db } from "../../lib/firebase";
+import { createSiteSettings } from "../../lib/createSiteSettings";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,6 +11,9 @@ import { FirebaseError } from "firebase/app";
 import { getDoc, doc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 import { onAuthStateChanged } from "firebase/auth";
+import { parsePhoneNumberFromString, AsYouType } from "libphonenumber-js";
+import validator from "validator";
+import { handleSearchAddress } from "@/lib/addressUtil";
 
 export default function RegisterPage() {
   const [email, setEmail] = useState("");
@@ -22,27 +24,24 @@ export default function RegisterPage() {
   const [ownerAddress, setOwnerAddress] = useState("");
   const [ownerPhone, setOwnerPhone] = useState("");
   const [loading, setLoading] = useState(false);
-  const [homepageUrl, setHomepageUrl] = useState("");
+  const [isFreePlan, setIsFreePlan] = useState(false);
+  const [postalCode, setPostalCode] = useState("");
+  const [isSearchingAddress, setIsSearchingAddress] = useState(false);
 
   const router = useRouter();
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (!user) {
-        router.push("/login");
-      }
+      if (!user) router.push("/login");
     });
-
     return () => unsubscribe();
   }, [router]);
 
   const handleRegister = async () => {
     setLoading(true);
     try {
-      // ✅ Firestore にドキュメントが既にあるかチェック
       const ref = doc(db, "siteSettings", siteKey);
       const snap = await getDoc(ref);
-
       if (snap.exists()) {
         const confirmOverwrite = window.confirm(
           "この siteKey はすでに使われています。上書きしてもよろしいですか？"
@@ -53,34 +52,81 @@ export default function RegisterPage() {
         }
       }
 
-      // ✅ このタイミングでアカウント作成
-      const userCred = await createUserWithEmailAndPassword(
-        auth,
-        email,
-        password
-      );
+      // ✅ サーバー側でFirebase Auth ユーザー作成（自動ログイン防止）
+      const userRes = await fetch("/api/stripe/create-firebase-user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
 
-      // ✅ Firestore 登録
+      if (!userRes.ok) {
+        const { error } = await userRes.json();
+
+        if (error === "email-already-in-use") {
+          alert("このメールアドレスはすでに登録されています。");
+          return;
+        }
+
+        if (error === "invalid-password") {
+          alert("パスワードは6文字以上で入力してください。");
+          return;
+        }
+
+        throw new Error("Firebaseアカウントの作成に失敗しました");
+      }
+
+      const { uid } = await userRes.json();
+
+      let customerId: string | null = null;
+      let subscriptionId: string | null = null;
+
+      // Stripe 顧客作成（無料プランでない場合）
+      if (!isFreePlan) {
+        const stripeRes = await fetch("/api/stripe/create-stripe-customer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email,
+            name: ownerName,
+            metadata: {
+              siteKey,
+              siteName,
+              ownerPhone,
+            },
+          }),
+        });
+
+        if (!stripeRes.ok) {
+          throw new Error("Stripeの登録に失敗しました");
+        }
+
+        const json = await stripeRes.json();
+        customerId = json.customerId;
+        subscriptionId = json.subscriptionId;
+      }
+
+      // Firestore に siteSettings を保存
       await createSiteSettings(siteKey, {
-        ownerId: userCred.user.uid,
+        ownerId: uid,
         siteName,
         siteKey,
         ownerName,
         ownerAddress,
         ownerEmail: email,
         ownerPhone,
-        homepageUrl,
+        isFreePlan,
+        ...(customerId && { stripeCustomerId: customerId }),
+        ...(subscriptionId && { stripeSubscriptionId: subscriptionId }),
       });
 
-      // ✅ メール通知など
+      // メール通知（パスワード付き）
       await fetch("/api/send-registration-mail", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
       });
 
-      alert("登録完了しました");
-      // 初期化
+      alert("登録が完了しました！");
       setEmail("");
       setPassword("");
       setSiteKey("");
@@ -88,17 +134,17 @@ export default function RegisterPage() {
       setOwnerName("");
       setOwnerAddress("");
       setOwnerPhone("");
+      setIsFreePlan(false);
     } catch (e) {
       if (e instanceof FirebaseError) {
-        if (e.code === "auth/email-already-in-use") {
-          alert(
-            "このメールアドレスはすでに登録されています。別のアドレスをお使いください。"
-          );
-        } else {
-          alert("登録時にエラーが発生しました: " + e.message);
-        }
+        alert(
+          e.code === "auth/email-already-in-use"
+            ? "このメールアドレスはすでに登録されています。"
+            : "登録時にエラーが発生しました: " + e.message
+        );
       } else {
         alert("不明なエラーが発生しました。");
+        console.error(e);
       }
     } finally {
       setLoading(false);
@@ -106,7 +152,17 @@ export default function RegisterPage() {
   };
 
   return (
-     <div className="flex flex-col items-center justify-center min-h-[calc(100vh-120px)] gap-6 p-8">
+    <div className="flex flex-col items-center justify-center min-h-[calc(100vh-120px)] gap-6 p-8">
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id="freePlan"
+          checked={isFreePlan}
+          onChange={(e) => setIsFreePlan(e.target.checked)}
+        />
+        <label htmlFor="freePlan">無料プランにする（Stripe連携しない）</label>
+      </div>
+
       <Card className="w-full max-w-md shadow-lg">
         <CardHeader>
           <CardTitle>アカウント登録</CardTitle>
@@ -118,6 +174,17 @@ export default function RegisterPage() {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
           />
+          {email && (
+            <p
+              className={`text-sm ${
+                validator.isEmail(email) ? "text-green-600" : "text-red-600"
+              }`}
+            >
+              {validator.isEmail(email)
+                ? "✅ 有効なメールアドレス形式です"
+                : "⚠️ メールアドレスの形式が不正です"}
+            </p>
+          )}
           <div className="flex gap-2">
             <Input
               type="text"
@@ -128,20 +195,30 @@ export default function RegisterPage() {
             />
             <Button
               type="button"
-              onClick={() => {
-                const generated = Math.random().toString(36).slice(-10);
-                setPassword(generated);
-              }}
+              onClick={() => setPassword(Math.random().toString(36).slice(-10))}
             >
               自動生成
             </Button>
           </div>
           <Input
             type="text"
-            placeholder="sityKey（英数字）"
+            placeholder="siteKey（英数字）"
             value={siteKey}
             onChange={(e) => setSiteKey(e.target.value)}
           />
+          {siteKey && (
+            <p
+              className={`text-sm ${
+                /^[a-zA-Z0-9]+$/.test(siteKey)
+                  ? "text-green-600"
+                  : "text-red-600"
+              }`}
+            >
+              {/^[a-zA-Z0-9]+$/.test(siteKey)
+                ? "✅ 半角英数字の形式です"
+                : "⚠️ siteKeyは半角英数字のみで入力してください"}
+            </p>
+          )}
           <Input
             type="text"
             placeholder="サイト名"
@@ -156,22 +233,58 @@ export default function RegisterPage() {
           />
           <Input
             type="text"
+            placeholder="郵便番号（例: 123-4567）"
+            maxLength={8}
+            value={postalCode}
+            onChange={(e) => {
+              let input = e.target.value.replace(/[^\d]/g, ""); // 数字以外を除去
+              if (input.length > 3) {
+                input = `${input.slice(0, 3)}-${input.slice(3, 7)}`;
+              }
+              setPostalCode(input);
+            }}
+            onBlur={() => {
+              const formattedZipCode = postalCode.replace("-", "");
+              (async () => {
+                await handleSearchAddress(
+                  formattedZipCode,
+                  setOwnerAddress,
+                  setIsSearchingAddress
+                );
+              })();
+            }}
+          />
+          {isSearchingAddress && (
+            <p className="text-sm text-gray-500">住所を検索中...</p>
+          )}
+          <Input
+            type="text"
             placeholder="住所"
             value={ownerAddress}
             onChange={(e) => setOwnerAddress(e.target.value)}
           />
-          <Input
-            type="tel"
-            placeholder="電話番号"
-            value={ownerPhone}
-            onChange={(e) => setOwnerPhone(e.target.value)}
-          />
-          <Input
-            type="url"
-            placeholder="ホームページURL（任意）"
-            value={homepageUrl}
-            onChange={(e) => setHomepageUrl(e.target.value)}
-          />
+          <div className="space-y-1">
+            <Input
+              type="tel"
+              placeholder="電話番号（例: 09012345678）"
+              value={ownerPhone}
+              onChange={(e) => {
+                const input = e.target.value;
+
+                // 入力整形（日本を想定）
+                const formatted = new AsYouType("JP").input(input);
+                setOwnerPhone(formatted);
+              }}
+            />
+            {/* バリデーション結果表示（任意） */}
+            {ownerPhone && (
+              <p className="text-sm text-gray-500">
+                {parsePhoneNumberFromString(ownerPhone, "JP")?.isValid()
+                  ? "✅ 有効な電話番号です"
+                  : "⚠️ 無効な形式の電話番号です"}
+              </p>
+            )}
+          </div>
           <Button
             onClick={handleRegister}
             disabled={loading}
@@ -179,7 +292,6 @@ export default function RegisterPage() {
           >
             {loading ? "登録中..." : "登録する"}
           </Button>
-
         </CardContent>
       </Card>
     </div>
