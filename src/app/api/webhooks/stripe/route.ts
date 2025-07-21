@@ -9,12 +9,46 @@ export const config = {
   },
 };
 
-
-
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+const vercelToken = process.env.VERCEL_TOKEN!;
+
+// 🔧 Vercel プロジェクト削除関数
+async function deleteVercelProject(siteKey: string) {
+  const res = await fetch(`https://api.vercel.com/v9/projects/${siteKey}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${vercelToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    const error = await res.json();
+    console.error("Vercel project deletion failed:", error);
+    throw new Error(`Failed to delete Vercel project: ${res.status}`);
+  }
+
+  console.log(`✅ Vercel project "${siteKey}" deleted successfully`);
+}
+
+// 🔍 FirestoreからcustomerIdでsiteKeyを逆引きする補助関数
+async function getSiteKeyByCustomerId(
+  customerId: string
+): Promise<string | null> {
+  const snapshot = await adminDb
+    .collection("siteSettings")
+    .where("stripeCustomerId", "==", customerId)
+    .limit(1)
+    .get();
+
+  if (!snapshot.empty) {
+    return snapshot.docs[0].id;
+  }
+  return null;
+}
 
 export async function POST(req: NextRequest) {
-  const rawBody = await req.text(); // Next.jsでは text() を使う
+  const rawBody = await req.text();
   const sig = req.headers.get("stripe-signature")!;
 
   let event: Stripe.Event;
@@ -26,7 +60,6 @@ export async function POST(req: NextRequest) {
     return new NextResponse("Webhook Error", { status: 400 });
   }
 
-  // 各イベントに応じて処理を分ける
   try {
     switch (event.type) {
       case "checkout.session.completed": {
@@ -79,6 +112,9 @@ export async function POST(req: NextRequest) {
           await adminDb.doc(`siteSettings/${siteKey}`).update({
             subscriptionStatus: "canceled",
           });
+
+          // 🔥 Vercelプロジェクト削除
+          await deleteVercelProject(siteKey);
         }
         break;
       }
@@ -92,18 +128,4 @@ export async function POST(req: NextRequest) {
     console.error("Webhook handler error:", err);
     return new NextResponse("Internal Server Error", { status: 500 });
   }
-}
-
-// 🔍 FirestoreからcustomerIdでsiteKeyを逆引きする補助関数
-async function getSiteKeyByCustomerId(customerId: string): Promise<string | null> {
-  const snapshot = await adminDb
-    .collection("siteSettings")
-    .where("stripeCustomerId", "==", customerId)
-    .limit(1)
-    .get();
-
-  if (!snapshot.empty) {
-    return snapshot.docs[0].id;
-  }
-  return null;
 }
